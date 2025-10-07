@@ -92,6 +92,25 @@ def logprobs_from_logits(logits, labels, inplace_backward=True):
     return output
 
 
+def logprobs_from_logits_topk(logits, labels, inplace_backward=True):
+    k=20
+    topk_logits, topk_idx = torch.topk(logits, k=k, dim=-1)
+
+    labels_unsq = labels.unsqueeze(-1)
+    in_topk = (topk_idx == labels_unsq).any(dim=-1)
+
+    logsumexp_values = torch.logsumexp(topk_logits, dim=-1)
+    logp_full = torch.full_like(logits, -1e4, dtype=logits.dtype)
+    logp_topk = topk_logits - logsumexp_values.unsqueeze(-1)
+
+    logp_topk = logp_topk.to(logp_full.dtype)
+    logp_full.scatter_(dim=-1, index=topk_idx, src=logp_topk)
+    output = logp_full.gather(
+        dim=-1, index=labels.unsqueeze(-1)
+    ).squeeze(-1)
+    return output
+
+
 def logprobs_from_logits_flash_attn(logits, labels, inplace_backward=True):
     output = cross_entropy_loss(logits, labels, inplace_backward=inplace_backward)
     assert isinstance(output, tuple), "please make sure flash-attn>=2.4.3 where cross_entropy_loss returns Tuple[losses, z_losses]."
@@ -145,6 +164,14 @@ def entropy_from_logits(logits: torch.Tensor):
     pd = torch.nn.functional.softmax(logits, dim=-1)
     entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
     return entropy
+
+
+def entropy_grad_from_logits(logits: torch.Tensor):
+    pd = torch.nn.functional.softmax(logits, dim=-1)
+    Z = torch.logsumexp(logits, dim=-1)
+    entropy = Z - torch.sum(pd * logits, dim=-1)
+    entropy_grad = -(pd * pd * (logits - Z.unsqueeze(-1))).sum(dim=-1)
+    return entropy_grad
 
 
 def entropy_from_logits_with_chunking(logits: torch.Tensor, chunk_size: int = 2048):

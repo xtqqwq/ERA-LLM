@@ -201,6 +201,12 @@ actor_rollout_ref:
       # KL divergence penalty coefficient
       ppo_kl_coef: 0.1
 
+    era_lb: 0.45
+    era_ub: 3.0
+    era_k: 2.0
+    adv_scale: False
+    topk: False
+
     # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
     clip_ratio_c: 3.0
 

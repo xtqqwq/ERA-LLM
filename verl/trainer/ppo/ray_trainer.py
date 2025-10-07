@@ -31,6 +31,7 @@ from typing import Optional, Type
 import numpy as np
 import ray
 import torch
+from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -595,7 +596,7 @@ class RayPPOTrainer:
 
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
-
+    
     def _validate(self):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
@@ -604,79 +605,116 @@ class RayPPOTrainer:
         sample_inputs = []
         sample_outputs = []
         sample_scores = []
-
+        metric_dict = {}
         for test_data in self.val_dataloader:
-            test_batch = DataProto.from_single_dict(test_data)
+            # test_batch = DataProto.from_single_dict(test_data)
+            data_sources = test_data["data_source"]
 
-            # repeat test batch
-            test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True)
+            # 找到对应的 index（假设 data_sources 是 list of strings）
+            math_indices = [i for i, src in enumerate(data_sources) if src in ["amc", "aime", "aime25"]]
+            non_math_indices = [i for i, src in enumerate(data_sources) if src not in ["amc", "aime", "aime25"]]
+            print(f"len of pass32: {len(math_indices)}, len of pass1: {len(non_math_indices)}")
+            assert len(math_indices) + len(non_math_indices) == len(data_sources), f"math_indices: {math_indices}, non_math_indices: {non_math_indices}, data_sources: {data_sources}"
+            # 将所有字段按照 index 切分
+            def index_select_batch(data, indices):
+                if isinstance(data, torch.Tensor):
+                    return data[indices]
+                elif isinstance(data, list):
+                    return [data[i] for i in indices]
+                elif isinstance(data, np.ndarray):
 
-            # we only do validation on rule-based rm
-            if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
-                return {}
+                    return data[indices]
+                else:
+                    raise TypeError(f"Unsupported data type: {type(data)}")
 
-            # Store original inputs
-            input_ids = test_batch.batch["input_ids"]
-            # TODO: Can we keep special tokens except for padding tokens?
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
+            data32 = {k: index_select_batch(v, math_indices) for k, v in test_data.items()}
+            data1 = {k: index_select_batch(v, non_math_indices) for k, v in test_data.items()}
 
-            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-            non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-            if "multi_modal_data" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("multi_modal_data")
-            if "raw_prompt" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("raw_prompt")
-            if "tools_kwargs" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("tools_kwargs")
-            if "interaction_kwargs" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("interaction_kwargs")
-            test_gen_batch = test_batch.pop(
-                batch_keys=batch_keys_to_pop,
-                non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-            )
+            test_batch32 = DataProto.from_single_dict(data32)
+            test_batch1 = DataProto.from_single_dict(data1)
 
-            test_gen_batch.meta_info = {
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "pad_token_id": self.tokenizer.pad_token_id,
-                "recompute_log_prob": False,
-                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
-                "validate": True,
-            }
-            print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
+            def get_output(test_batch, is_sample=False, temperature=0.6):
+                # repeat test batch
+                test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True)
 
-            # pad to be divisible by dp_size
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
-            if not self.async_rollout_mode:
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+                # we only do validation on rule-based rm
+                if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
+                    return {}
+
+                # Store original inputs
+                input_ids = test_batch.batch["input_ids"]
+                # TODO: Can we keep special tokens except for padding tokens?
+                input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+                sample_inputs.extend(input_texts)
+
+                batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+                non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+                if "multi_modal_inputs" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.extend(["multi_modal_data", "multi_modal_inputs"])
+                if "raw_prompt" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("raw_prompt")
+                if "tools_kwargs" in test_batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("tools_kwargs")
+                test_gen_batch = test_batch.pop(
+                    batch_keys=batch_keys_to_pop,
+                    non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+                )
+
+                test_gen_batch.meta_info = {
+                    "eos_token_id": self.tokenizer.eos_token_id,
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                    "recompute_log_prob": False,
+                    "do_sample": is_sample,
+                    "validate": True,
+                    'validate_temperature': temperature,
+                }
+                print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
+                # pad to be divisible by dp_size
+                test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
+                if not self.async_rollout_mode:
+                    test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+                else:
+                    self.async_rollout_manager.wake_up()
+                    test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+                    self.async_rollout_manager.sleep()
+
+                # unpad
+                test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+                print("validation generation end")
+
+                # Store generated outputs
+                output_ids = test_output_gen_batch.batch["responses"]
+                output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+                sample_outputs.extend(output_texts)
+
+                test_batch = test_batch.union(test_output_gen_batch)
+                return test_batch
+
+            if len(test_batch32)==0:
+                test_batch = get_output(test_batch1, is_sample=False)
+            elif len(test_batch1)==0:
+                test_batch = get_output(test_batch32, is_sample=True, temperature=0.6)
+            elif len(test_batch32) > 0 and len(test_batch1) > 0:
+                test_batch32 = get_output(test_batch32, is_sample=True, temperature=0.6)
+                test_batch1 = get_output(test_batch1, is_sample=False)
+                test_batch = DataProto.concat([test_batch32, test_batch1])
             else:
-                self.async_rollout_manager.wake_up()
-                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
-                self.async_rollout_manager.sleep()
-
-            # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
-            print("validation generation end")
-
-            # Store generated outputs
-            output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-            sample_outputs.extend(output_texts)
-
-            test_batch = test_batch.union(test_output_gen_batch)
+                raise ValueError(f"Both test_batch32 and test_batch1 are empty: {len(test_batch32)=}, {len(test_batch1)=}")
 
             # evaluate using reward_function
             result = self.val_reward_fn(test_batch, return_dict=True)
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
+            # print(f"reward_tensor shape: {reward_tensor.shape}, scores shape: {len(scores)}")
             sample_scores.extend(scores)
 
+            # log validate score
+            metric_dict["val/score-all"] = np.mean(scores)
+
             reward_extra_infos_dict["reward"].extend(scores)
-            print(f"len reward_extra_infos_dict['reward']: {len(reward_extra_infos_dict['reward'])}")
             if "reward_extra_info" in result:
                 for key, lst in result["reward_extra_info"].items():
                     reward_extra_infos_dict[key].extend(lst)
-                    print(f"len reward_extra_infos_dict['{key}']: {len(reward_extra_infos_dict[key])}")
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
@@ -697,9 +735,9 @@ class RayPPOTrainer:
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
 
         data_sources = np.concatenate(data_source_lst, axis=0)
-
+        print(f"data_sources: {data_sources[:10]}, ")
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
-        metric_dict = {}
+
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
             for var_name, metric2val in var2metric2val.items():
@@ -914,6 +952,7 @@ class RayPPOTrainer:
         from verl.utils.tracking import Tracking
 
         logger = Tracking(
+            entity_name=self.config.trainer.entity_name,
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
             default_backend=self.config.trainer.logger,

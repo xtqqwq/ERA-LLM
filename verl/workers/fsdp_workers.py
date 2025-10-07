@@ -72,6 +72,189 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+import math
+from torch import nn
+
+class ERA(nn.Module):
+    def __init__(self, H_tau_min, n_samples, topp):
+        super().__init__()
+        self._tau = 3
+        self.H_tau_min = H_tau_min
+        self.n_samples = n_samples
+        self.topp = topp
+
+        self.upper_bound = math.log(self._tau) / self._tau
+        assert H_tau_min >= self.upper_bound
+        self.slope = torch.zeros(n_samples + 1)
+        self.b = torch.zeros(n_samples + 1)
+        self.slope[1] = 0
+        self.b[1] = self.upper_bound
+        for n in range(2, n_samples + 1):
+            self.slope[n] = (self.upper_bound - H_tau_min / n) / (1 - 1 / n)
+            self.b[n] = (H_tau_min - self.slope[n]) / n
+
+    def forward(self, x):
+        topk_values, topk_indices = torch.topk(x, k=self.n_samples, dim=-1)
+        probs = topk_values.softmax(dim=-1)
+        sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
+        cum_probs = torch.cumsum(sorted_probs, dim=-1)
+
+        mask = cum_probs >= self.topp
+        mask[:, self.n_samples - 1] = 1
+        indices = self.n_samples - mask.int().sum(dim=-1, keepdim=True)
+        # indices = mask.int().argmax(dim=-1, keepdim=True)
+        k_per_sample = indices + 1
+        k_per_sample = torch.clamp(k_per_sample, min=1, max=self.n_samples)
+        print(k_per_sample.squeeze(-1))
+        # device = x.device
+        # slope = self.slope.to(device)
+        # b = self.b.to(device)
+        # slope_per_sample = slope[k_per_sample.squeeze(-1)].unsqueeze(-1)
+        # b_per_sample = b[k_per_sample.squeeze(-1)].unsqueeze(-1)
+
+        dynamic_k_mask = torch.arange(self.n_samples, device=x.device) < k_per_sample
+        selected_probs = torch.where(
+            dynamic_k_mask,
+            sorted_probs,
+            torch.zeros_like(sorted_probs)
+        )
+
+        # denom = selected_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        # selected_probs = selected_probs / denom
+        # print("#0:", selected_probs[0][0])
+        # if len(selected_probs[0]) > 1:
+        #     print("#1:", selected_probs[0][1])
+        # if len(selected_probs[0]) > 2:
+        #     print("#2:", selected_probs[0][2])
+
+        # h = slope_per_sample * selected_probs + b_per_sample
+        # h = h - h.detach() + torch.clamp(h, min=1e-8, max=self.upper_bound - 1e-8).detach()
+        # u = -1 - torch.log(h)
+        # new_logits = (-1 - torch.sqrt(2 * u) - 3/4 * u)
+        # new_logits = new_logits.to(x.dtype)
+        new_logits = topk_values.sort(dim=-1, descending=True)[0]
+        # new_logits = torch.log(selected_probs + 1e-10)
+        new_logits = new_logits.to(x.dtype)
+        # print(sorted_probs[0][2] - new_logits[0][2].softmax(dim=-1))
+
+        max_values = torch.max(x, dim=-1, keepdim=True).values.detach()
+        x = x - max_values - 1000
+        min_values = torch.gather(new_logits, dim=-1, index=k_per_sample - 1).detach()
+        new_logits = new_logits - min_values
+
+        final_indices = torch.gather(topk_indices, -1, sorted_indices)
+        final_values = torch.where(
+            dynamic_k_mask,
+            new_logits,
+            -1000
+        )
+        x.scatter_(-1, final_indices, final_values)
+
+        # print(probs[0][0] - torch.topk(x[0][0], k=self.n_samples, dim=-1)[0].softmax(dim=-1))
+
+        return x
+
+from typing import List, Tuple, Union, Optional
+from transformers.processing_utils import Unpack
+from transformers.cache_utils import Cache
+from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+from transformers.utils.generic import LossKwargs
+
+class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
+
+def new_forward(
+    self,
+    input_ids: torch.LongTensor = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+    inputs_embeds: Optional[torch.FloatTensor] = None,
+    labels: Optional[torch.LongTensor] = None,
+    use_cache: Optional[bool] = None,
+    output_attentions: Optional[bool] = None,
+    output_hidden_states: Optional[bool] = None,
+    return_dict: Optional[bool] = None,
+    cache_position: Optional[torch.LongTensor] = None,
+    logits_to_keep: Union[int, torch.Tensor] = 0,
+    **kwargs: Unpack[KwargsForCausalLM],
+) -> Union[Tuple, CausalLMOutputWithPast]:
+    r"""
+    Args:
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+            config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+
+        logits_to_keep (`int` or `torch.Tensor`, *optional*):
+            If an `int`, compute logits for the last `logits_to_keep` tokens. If `0`, calculate logits for all
+            `input_ids` (special case). Only last token logits are needed for generation, and calculating them only for that
+            token can save memory, which becomes pretty significant for long sequences or large vocabulary size.
+            If a `torch.Tensor`, must be 1D corresponding to the indices to keep in the sequence length dimension.
+            This is useful when using packed tensor format (single dimension for batch and sequence length).
+
+    Returns:
+
+    Example:
+
+    ```python
+    >>> from transformers import AutoTokenizer, Qwen2ForCausalLM
+
+    >>> model = Qwen2ForCausalLM.from_pretrained("meta-qwen2/Qwen2-2-7b-hf")
+    >>> tokenizer = AutoTokenizer.from_pretrained("meta-qwen2/Qwen2-2-7b-hf")
+
+    >>> prompt = "Hey, are you conscious? Can you talk to me?"
+    >>> inputs = tokenizer(prompt, return_tensors="pt")
+
+    >>> # Generate
+    >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
+    >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+    "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
+    ```"""
+    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+    output_hidden_states = (
+        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+    )
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+    outputs = self.model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        output_attentions=output_attentions,
+        output_hidden_states=output_hidden_states,
+        return_dict=return_dict,
+        cache_position=cache_position,
+        **kwargs,
+    )
+
+    hidden_states = outputs[0]
+    # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+    logits = self.lm_head(hidden_states[:, slice_indices, :])
+    # logits = self.era(logits)
+
+    loss = None
+    if labels is not None:
+        loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+
+    if not return_dict:
+        output = (logits,) + outputs[1:]
+        return (loss,) + output if loss is not None else output
+
+    return CausalLMOutputWithPast(
+        loss=loss,
+        logits=logits,
+        past_key_values=outputs.past_key_values,
+        hidden_states=outputs.hidden_states,
+        attentions=outputs.attentions,
+    )
+
+
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
         device_mesh = init_device_mesh(device_name, mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
@@ -252,6 +435,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 config=actor_model_config,
                 trust_remote_code=trust_remote_code,
             )
+            # era = ERA(0.4, 200, 0.95)
+            # print("Adding ERA layer with coef: 0.4, 200, 0.95")
+            # actor_module.add_module("era", era)
+            # import types
+            # actor_module.forward = types.MethodType(new_forward, actor_module)
 
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
@@ -702,8 +890,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
+            apply_topk = self.config.actor.topk
             with adapter_ctx:
-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                if self.config.actor.policy_loss.loss_mode == "era":
+                    output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True, apply_topk=apply_topk, apply_era=True, era_lb=self.config.actor.era_lb, era_ub=self.config.actor.era_ub, era_k=self.config.actor.era_k)
+                else:
+                    output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True, apply_topk=apply_topk)
             output = DataProto.from_dict(
                 tensors={"old_log_probs": output, "entropys": entropys},
                 meta_info={"temperature": self.config.rollout.temperature},

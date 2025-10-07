@@ -21,10 +21,10 @@ from typing import Any, Callable, Dict, List
 
 import numpy as np
 import torch
+import math
 
 from verl import DataProto
 from verl.utils.import_utils import deprecated
-
 
 @deprecated("verl.utils.metric.reduce_metrics")
 def reduce_metrics(metrics: Dict[str, List[Any]]) -> Dict[str, Any]:
@@ -50,12 +50,12 @@ def reduce_metrics(metrics: Dict[str, List[Any]]) -> Dict[str, Any]:
 def _compute_response_info(batch: DataProto) -> Dict[str, Any]:
     """
     Computes information about prompts and responses from a batch.
-
+    
     This is an internal helper function that extracts masks and lengths for prompts and responses.
-
+    
     Args:
         batch: A DataProto object containing batch data with responses and attention masks.
-
+        
     Returns:
         A dictionary containing:
             - response_mask: Attention mask for the response tokens
@@ -172,9 +172,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
 def compute_timing_metrics(batch: DataProto, timing_raw: Dict[str, float]) -> Dict[str, Any]:
     """
     Computes timing metrics for different processing stages in PPO training.
-
-    This function calculates both raw timing metrics (in seconds) and per-token timing metrics
-    (in milliseconds) for various processing stages like generation, reference computation,
+    
+    This function calculates both raw timing metrics (in seconds) and per-token timing metrics 
+    (in milliseconds) for various processing stages like generation, reference computation, 
     value computation, advantage computation, and model updates.
 
     Args:
@@ -211,23 +211,23 @@ def compute_timing_metrics(batch: DataProto, timing_raw: Dict[str, float]) -> Di
 def compute_throughout_metrics(batch: DataProto, timing_raw: Dict[str, float], n_gpus: int) -> Dict[str, Any]:
     """
     Computes throughput metrics for PPO training.
-
+    
     This function calculates performance metrics related to token processing speed,
     including the total number of tokens processed, time per step, and throughput
     (tokens per second per GPU).
-
+    
     Args:
         batch: A DataProto object containing batch data with meta information about token counts.
         timing_raw: A dictionary mapping stage names to their execution times in seconds.
                    Must contain a "step" key with the total step time.
         n_gpus: Number of GPUs used for training.
-
+        
     Returns:
         A dictionary containing:
             - perf/total_num_tokens: Total number of tokens processed in the batch
             - perf/time_per_step: Time taken for the step in seconds
             - perf/throughput: Tokens processed per second per GPU
-
+            
     Note:
         The throughput is calculated as total_tokens / (time * n_gpus) to normalize
         across different GPU counts.
@@ -321,20 +321,68 @@ def calc_maj_val(data: list[dict[str, Any]], vote_key: str, val_key: str) -> flo
     return maj_val
 
 
-def process_validation_metrics(data_sources: list[str], sample_inputs: list[str], infos_dict: dict[str, list[Any]], seed: int = 42) -> dict[str, dict[str, dict[str, float]]]:
+def calc_pass_at_k_bool(pass_list: list[bool], k: int) -> float:
+    """
+    Calculate pass@k metric for boolean pass indicators.
+    
+    Pass@k is the probability that at least one sample in a random subset of k samples
+    passes (is True). This is commonly used in code generation tasks where a sample
+    is considered to "pass" if it meets certain criteria (e.g., compiles, passes tests).
+    
+    Args:
+        pass_list: List of boolean values indicating whether each sample passes.
+        k: Number of samples to consider in each subset.
+    
+    Returns:
+        The pass@k probability as a float between 0 and 1.
+        
+    Example:
+        >>> data = [True, False, True, False, True]
+        >>> calc_pass_at_k_bool(data, k=3)
+        0.9  # 90% chance that at least one sample in a random subset of 3 passes
+    """
+    if k > len(pass_list):
+        return 0.0
+    
+    # Count how many samples pass
+    passing_samples = sum(pass_list)
+    
+    if passing_samples == 0:
+        return 0.0
+    
+    # Calculate pass@k using the formula: 1 - C(n-f, k) / C(n, k)
+    # where n = total samples, f = failing samples, k = subset size
+    n = len(pass_list)
+    f = n - passing_samples  # failing samples
+    
+    if f >= k:
+        # If there are k or more failing samples, it's possible to select all failing samples
+        # We need to calculate the probability of selecting at least one passing sample
+        from math import comb
+        total_combinations = comb(n, k)
+        failing_combinations = comb(f, k)
+        return 1.0 - (failing_combinations / total_combinations)
+    else:
+        # If there are fewer than k failing samples, we're guaranteed to have at least one passing sample
+        return 1.0
+
+
+def process_validation_metrics(data_sources: list[str], sample_inputs: list[str], infos_dict: dict[str, list[Any]], seed: int = 42, pass_at_k_config: dict = None) -> dict[str, dict[str, dict[str, float]]]:
     """
     Process validation metrics into a structured format with statistical analysis.
-
+    
     This function organizes validation metrics by data source and prompt, then computes
     various statistical measures including means, standard deviations, best/worst values,
-    and majority voting results. It also performs bootstrap sampling to estimate statistics
+    majority voting results, and pass@k metrics. It also performs bootstrap sampling to estimate statistics
     for different sample sizes.
-
+    
     Args:
         data_sources: List of data source identifiers for each sample.
         sample_inputs: List of input prompts corresponding to each sample.
         infos_dict: Dictionary mapping variable names to lists of values for each sample.
         seed: Random seed for bootstrap sampling. Defaults to 42.
+        pass_at_k_config: Configuration for pass@k calculations. If None, uses default values.
+            Expected format: {"ks": [1, 5, 10]}. Defaults to None.
 
     Returns:
         A nested dictionary with the structure:
@@ -345,7 +393,7 @@ def process_validation_metrics(data_sources: list[str], sample_inputs: list[str]
                 }
             }
         }
-
+        
         Where metric_name includes:
         - "mean@N": Mean value across N samples
         - "std@N": Standard deviation across N samples
@@ -355,14 +403,20 @@ def process_validation_metrics(data_sources: list[str], sample_inputs: list[str]
         - "worst@N/std": Standard deviation of the worst values in bootstrap samples
         - "maj@N/mean": Mean of majority voting results in bootstrap samples (if "pred" exists)
         - "maj@N/std": Standard deviation of majority voting results (if "pred" exists)
-
+        - "pass@k": Pass@k probability for specific k values (for reward/acc fields)
+        
     Example:
         >>> data_sources = ["source1", "source1", "source2"]
         >>> sample_inputs = ["prompt1", "prompt1", "prompt2"]
-        >>> infos_dict = {"score": [0.8, 0.9, 0.7], "pred": ["A", "A", "B"]}
-        >>> result = process_validation_metrics(data_sources, sample_inputs, infos_dict)
-        >>> # result will contain statistics for each data source and variable
+        >>> infos_dict = {"reward": [1.0, 0.0, 1.0], "acc": [True, False, True]}
+        >>> pass_at_k_config = {"ks": [1, 2]}
+        >>> result = process_validation_metrics(data_sources, sample_inputs, infos_dict, pass_at_k_config=pass_at_k_config)
+        >>> # result will contain statistics for each data source and variable, including pass@k metrics
     """
+    # Set default pass@k configuration if not provided
+    if pass_at_k_config is None:
+        pass_at_k_config = {"ks": [1, 2, 4, 8, 16, 32]}
+    
     # Group metrics by data source, prompt and variable
     data_src2prompt2var2vals = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     for sample_idx, data_source in enumerate(data_sources):
@@ -406,6 +460,19 @@ def process_validation_metrics(data_sources: list[str], sample_inputs: list[str]
                                 seed=seed,
                             )
                             metric[f"maj@{n}/mean"], metric[f"maj@{n}/std"] = maj_n_mean, maj_n_std
+                
+                # Calculate pass@k metrics for reward and acc fields
+                if var_name in ["reward", "acc"]:
+                    # Convert to boolean: reward=1.0 or acc=True means pass
+                    if var_name == "reward":
+                        pass_list = [val == 1.0 for val in var_vals]
+                    else:  # var_name == "acc"
+                        pass_list = [bool(val) for val in var_vals]
+                    
+                    for k in pass_at_k_config["ks"]:
+                        if k <= n_resps:  # Only calculate if k is not larger than available samples
+                            pass_at_k_val = calc_pass_at_k_bool(pass_list, k)
+                            metric[f"pass@{k}"] = pass_at_k_val
 
                 data_src2prompt2var2metric[data_source][prompt][var_name] = metric
 
@@ -424,3 +491,4 @@ def process_validation_metrics(data_sources: list[str], sample_inputs: list[str]
                 data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(prompt_vals)
 
     return data_src2var2metric2val
+
