@@ -7,7 +7,7 @@ SPLIT="test"
 NUM_TEST_SAMPLE=-1
 
 DATA_NAME="aime24,aime25,amc23,math500,minerva_math,olympiadbench"
-IFS="," read -ra BENCHMARK_ARRAY <<< "$benchmarks"
+IFS="," read -ra BENCHMARK_ARRAY <<< "$DATA_NAME"
 REGULAR_BENCHMARKS=()
 SPECIAL_BENCHMARKS=()
 
