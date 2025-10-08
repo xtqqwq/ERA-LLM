@@ -26,7 +26,7 @@ if [ ${#REGULAR_BENCHMARKS[@]} -gt 0 ]; then
   TOKENIZERS_PARALLELISM=false \
   python3 -u math_eval.py \
     --model_name_or_path ${MODEL_NAME_OR_PATH} \
-    --data_name ${REGULAR_BENCHMARKS} \
+    --data_name ${REGULAR_BENCHMARKS_STR} \
     --output_dir ${OUTPUT_DIR} \
     --split ${SPLIT} \
     --prompt_type ${PROMPT_TYPE} \
