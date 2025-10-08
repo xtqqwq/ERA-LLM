@@ -29,7 +29,7 @@ if [ ${#REGULAR_BENCHMARKS[@]} -gt 0 ]; then
     --output_dir ${OUTPUT_DIR} \
     --split ${SPLIT} \
     --prompt_type ${PROMPT_TYPE} \
-    --num_test_sample 1 \
+    --num_test_sample ${NUM_TEST_SAMPLE} \
     --max_tokens_per_call 3000 \
     --seed 0 \
     --temperature 0 \
@@ -52,7 +52,7 @@ if [ ${#SPECIAL_BENCHMARKS[@]} -gt 0 ]; then
     --output_dir ${OUTPUT_DIR} \
     --split ${SPLIT} \
     --prompt_type ${PROMPT_TYPE} \
-    --num_test_sample 1 \
+    --num_test_sample ${NUM_TEST_SAMPLE} \
     --max_tokens_per_call 3000 \
     --seed 0 \
     --temperature 0.7 \
