@@ -22,6 +22,7 @@ done
 # Run regular benchmarks with n_sampling=1
 if [ ${#REGULAR_BENCHMARKS[@]} -gt 0 ]; then
   REGULAR_BENCHMARKS_STR=$(IFS=,; echo "${REGULAR_BENCHMARKS[*]}")
+  echo $REGULAR_BENCHMARKS_STR
   TOKENIZERS_PARALLELISM=false \
   python3 -u math_eval.py \
     --model_name_or_path ${MODEL_NAME_OR_PATH} \
@@ -44,7 +45,8 @@ if [ ${#REGULAR_BENCHMARKS[@]} -gt 0 ]; then
 fi
 
 if [ ${#SPECIAL_BENCHMARKS[@]} -gt 0 ]; then
-  SPECIAL_BENCHMARKS=$(IFS=,; echo "${SPECIAL_BENCHMARKS[*]}")
+  SPECIAL_BENCHMARKS_STR=$(IFS=,; echo "${SPECIAL_BENCHMARKS[*]}")
+  echo $SPECIAL_BENCHMARKS_STR
   TOKENIZERS_PARALLELISM=false \
   python3 -u math_eval.py \
     --model_name_or_path ${MODEL_NAME_OR_PATH} \
