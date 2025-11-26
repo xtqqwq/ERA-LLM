@@ -546,14 +546,14 @@ class DataParallelPPOActor(BasePPOActor):
 
                         assert ((top_entropy_mask & response_mask) == top_entropy_mask).all()
 
-                        mean_top_entropy = torch.stack(mean_top_entropy).unsqueeze(-1)  # shape: (bs,)
+                        mean_top_entropy = torch.stack(mean_top_entropy)  # shape: (bs,)
 
                         low_frac = (mean_top_entropy < era_lb).sum().item() / mean_top_entropy.shape[0]
                         high_frac = (mean_top_entropy > era_ub).sum().item() / mean_top_entropy.shape[0]
                         mid_frac = 1 - low_frac - high_frac
 
-                        cond_A = mean_top_entropy < era_lb
-                        cond_B = mean_top_entropy > era_ub
+                        cond_A = (mean_top_entropy < era_lb) & (advantages[:, 0] > 0)
+                        cond_B = (mean_top_entropy > era_ub) & (advantages[:, 0] > 0)
 
                         high_entropy_mean = mean_top_entropy.mean().detach().item()
                         low_entropy_mean = (verl_F.masked_mean(entropy, response_mask).detach().item() - 0.2 * high_entropy_mean) / 0.8
